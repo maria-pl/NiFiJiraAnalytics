@@ -1,5 +1,7 @@
 # NiFi_Jira_analytics
 
-Файлы проекта, посвященного автоматизации аналитики Jira Software средствами Apache NiFi.
+Files for Jira Software analytics automation project via Apache NiFi.
 
-Репозиторий содержит как сам шаблон, так и дополняющие его скрипты на R.
+The repository contains both the Apache NiFi template itself and its complementary R scripts.
+
+
