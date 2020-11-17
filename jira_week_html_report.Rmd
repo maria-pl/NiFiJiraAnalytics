@@ -1,0 +1,688 @@
+---
+title: " "
+output: html_document
+---
+
+<style>
+
+body {
+  font-size: 14px;
+  font-family: "Trebuchet MS"
+}
+
+</style>
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(lubridate)
+library(jsonlite)
+library(httr)
+library(textutils)
+
+library(gridSVG)
+library(ggplot2)
+library(flextable)
+library(kableExtra)
+library(officer)
+library(treemap)
+```
+
+
+<h2 style="color:#3A464F; font-size:28px; font-weight:bold; text-align:center; line-height: 42px; margin-top: 20px; margin-left: 25px; margin-bottom: 15px;"> <b>Еженедельный отчет по Jira - DIS.works</b></h2>
+
+<p style="color:#3A464F; font-weight:bold; text-align:center; margin-top: 10px; margin-left: 25px; margin-bottom: 10px;"><b>[ за период `r report_meta_data[1]` - `r report_meta_data[2]` ]</b></p>
+<hr>
+
+
+```{r Парсинг исходных данных, message=FALSE, warning=FALSE, include=FALSE}
+
+# Парсим базу эпиков
+jira_epics_base <- input_issues_data["epics_data"] %>% as.data.frame() 
+
+# Парсим таски за две последние недели
+jira_issues <- input_issues_data["issues"] %>% as.data.frame() 
+
+jira_issues <- jira_issues$issues.fields %>% mutate(key = jira_issues %>% select(issues.key) %>% unlist()) %>% 
+  mutate(issuetype.name =  jira_issues$issues.fields$issuetype %>% select(name)%>% unlist()) %>% 
+  mutate(project.name =  jira_issues$issues.fields$project %>% select(name)%>% unlist()) %>% 
+  mutate(priority.name =  jira_issues$issues.fields$priority %>% select(name)%>% unlist()) %>% 
+  mutate(assignee.displayName =  jira_issues$issues.fields$assignee %>% select(displayName)%>% unlist()) %>% 
+  mutate(status.name =  jira_issues$issues.fields$status %>% select(name) %>% unlist()) %>% 
+  mutate(parent.key =  jira_issues$issues.fields$parent %>% select(key) %>% unlist()) %>%
+  # Далее добавляю компоненты, по сути, как под-таблицу таблицы jira_issues.
+  cbind(jira_issues$issues.fields %>% select(components) %>% unnest_wider(col = components) %>% as.data.frame() %>% select(component = name)) %>%
+  # Оставим нужное
+ select(key, summary, timespent, created, timeoriginalestimate, description, customfield_10100, aggregatetimespent, resolutiondate, issuetype.name, project.name, priority.name, assignee.displayName, status.name, parent.key, component)  %>% 
+  rename(issueepic = customfield_10100) %>% 
+  # если есть parent.key и это эпик - отправим его в колонку issueepic
+  mutate(issueepic = ifelse(is.na(issueepic) & parent.key %in% jira_epics_base$epics_data.epic_key, parent.key, issueepic)) 
+
+
+# В файле jira_actual_worklog лежит актуальный ворклог по всем таскам за последние 2 недели
+
+jira_worklog <- readLines('/home/admin1/R_scripts/temp_data/jira_actual_worklog', encoding = "UTF-8") %>% fromJSON() %>% as.data.frame() %>% 
+  select(worklog.worklogs, worklog.issue_key) %>% unnest() %>% unique() 
+
+jira_worklog_data <- jira_worklog %>%
+  # Оставим необходимые колонки и поправим названия
+  select(key = worklog.issue_key, comment, created, started, time_spent = timeSpent, time_spent_seconds = timeSpentSeconds) %>% 
+  mutate(worklog_author = jira_worklog$updateAuthor$displayName) %>% 
+  # Поправим возможные ошибки при логировании
+  mutate(time_spent_seconds = ifelse(time_spent_seconds>39600, 39600, time_spent_seconds),time_spent = ifelse(time_spent_seconds>39600, "11h", time_spent)) %>%
+  # чистим логирование в выходные
+  filter(!lubridate::wday(started, week_start = 1) %in% c(6,7))
+
+
+# В файле jira_actual_changelog лежит актуальная история изменений по всем таскам за последние 2 недели
+
+jira_changelog <- readLines('/home/admin1/R_scripts/temp_data/jira_actual_changelog', encoding = "UTF-8") %>% fromJSON() %>% as.data.frame() 
+
+# открытие, работа над таской и ее закрытие таски  
+jira_changelog_data <- jira_changelog %>% mutate(key = jira_changelog$changelog.key) %>%
+  mutate(issue_type = jira_changelog$changelog.fields$issuetype %>% select(name) %>% unlist()) %>%
+  mutate(issue_created = jira_changelog$changelog.fields %>% select(created) %>% unlist()) %>%
+  mutate(issue_updated = jira_changelog$changelog.fields %>% select(updated) %>% unlist()) %>%
+  mutate(issue_resolutiondate = jira_changelog$changelog.fields %>% select(resolutiondate) %>% unlist()) %>% 
+  select(key, issue_type, issue_created, issue_updated, issue_resolutiondate)
+
+# изменения статуса таски
+issue_history <- jira_changelog$changelog.changelog %>% select(histories) %>% mutate(key = jira_changelog$changelog.key) %>% unnest(cols = histories) %>% 
+  select(created, items, key) %>% unnest(cols = items) %>% 
+  mutate(change_date = as.Date(created)) %>% 
+  filter(field == "status") %>%
+  select(-c(fieldtype, from, to, created, field))
+
+
+```
+
+
+```{r Подготовка данных по эпикам, echo=FALSE, message=FALSE, warning=FALSE}
+
+issue_and_epic_data <- jira_issues %>% mutate(issueepic = ifelse(issuetype.name =="Epic", key, issueepic)) %>% 
+  select(key, issueepic, component) %>% 
+  left_join(jira_epics_base %>% select(epics_data.epic_key, epics_data.epic_summary), by = c("issueepic"="epics_data.epic_key")) %>% 
+  unnest(cols = component, keep_empty = TRUE)  %>% 
+  select(key, issue_epic = issueepic, issue_component = component, epic_summary = epics_data.epic_summary) %>%
+
+  mutate(issue_component = str_replace(issue_component, "\\(Plan&Design\\) R2D", "R2D (Plan&Design)"),
+         issue_component = str_replace(issue_component, "\\(Develop\\) R2D", "R2D (Develop)"),
+         issue_component = str_replace(issue_component, "Correct \\(D2C\\)", "D2C (Correct)"),
+         issue_component = str_replace(issue_component, "RTD", "R2D (Deploy)")) 
+
+```
+
+
+```{r Выводим цифры за неделю, include=FALSE}
+
+
+start_date <- as.Date(str_replace_all(report_meta_data[1], "\\.", "-"))
+end_date <- as.Date(str_replace_all(report_meta_data[2], "\\.", "-"))
+
+# Открыто тасок
+
+this_week_opened <- jira_changelog_data %>% filter(issue_type != "Epic") %>% 
+  filter(as.Date(issue_created) >= start_date) %>% filter(as.Date(issue_created) <= end_date) %>% select(key, issue_created) %>% unique() %>% nrow()
+
+# В работе
+
+this_week_processed <- jira_worklog_data %>% filter(as.Date(started) >= start_date) %>% filter(as.Date(started) <= end_date) %>% 
+  select(key) %>% unique() %>% nrow()
+
+# Закрыто
+
+this_week_closed <- jira_changelog_data %>% filter(issue_type != "Epic") %>% 
+  filter(as.Date(issue_resolutiondate) >= start_date) %>% 
+  filter(as.Date(issue_resolutiondate) <= end_date) %>%
+  select(key, issue_created) %>% unique() %>% nrow()
+
+# Отправлено в холд / бэклог
+ 
+this_week_holded <- issue_history %>% filter(change_date >= start_date) %>% filter(change_date <= end_date) %>%
+  filter(toString == "Hold" | toString == "Backlog") %>% select(key) %>% unique() %>% nrow()
+  
+```
+
+<br>
+
+#### За прошедшую неделю имеем следующие цифры по таскам:
+
+<br>
+```{r Вывод статистик, echo=FALSE, warning=FALSE}
+jira_stat_base <- data.frame(opened = c(this_week_opened, "открыто"), 
+                             processed = c(this_week_processed, "было в работе"), 
+                             closed = c(this_week_closed, "закрыто"), 
+                             hold = c(this_week_holded, "отпр. в холд/бэклог"), stringsAsFactors = FALSE)
+
+jira_stat_base %>% flextable() %>% 
+                    theme_booktabs() %>% 
+                    width(width = 10) %>%
+                    delete_part(part = "header") %>% 
+                    padding(padding = 10,  part = "body") %>% 
+                    flextable::fontsize(i = ~ grepl("закрыто", closed), size = 17, part = "body") %>%
+                    flextable::fontsize(i = ~ !grepl("закрыто", closed), size = 23, part = "body") %>%
+                    bold(i = ~!grepl("закрыто", closed), j = 1:4, part = "body") %>%
+                    bg(bg = "#f8f9fb") %>%
+                    flextable::font(fontname = "Trebuchet MS") %>%
+                    align(align = "center", part = "body")%>% 
+                    color(color = "#333333", part = "body") %>%
+                    color(i = ~ !grepl("закрыто", closed), color = "#3A464F", part = "body") %>%
+                    border_remove() %>%
+                    flextable::border_inner(border = fp_border(color="#c8d0df", width = 1), part = "body")
+```
+
+<br>
+
+#### Логирование за неделю:
+
+
+```{r echo=FALSE, fig.height=7, fig.width=10.5, fig.align = c("center"), message=FALSE, warning=FALSE}
+
+library("RColorBrewer")
+getPalette = colorRampPalette(brewer.pal(9, "Set1"))
+
+jira_worklog_data %>% 
+  mutate(logged_date = as.Date(started)) %>% 
+  filter(logged_date >= start_date) %>%
+  filter(logged_date <= end_date) %>%
+  select(key, logged_date, time_spent_seconds, worklog_author) %>% 
+  group_by(key, logged_date, worklog_author) %>% 
+  summarise(logged_time = sum(time_spent_seconds)) %>% 
+  
+  left_join(issue_and_epic_data, by = "key") %>%
+  ungroup() %>%
+  
+  # фиксим дубли, которые появляются в случае нескольких компонент в одной таске
+  group_by(key, logged_date, worklog_author) %>% 
+  summarize(logged_time = sum(logged_time)/n())  %>% 
+  ungroup() %>%
+  
+  group_by(logged_date, worklog_author) %>% 
+  summarise(logged_time = sum(logged_time)) %>%
+  
+ ungroup() %>%
+ spread(key=worklog_author, value=logged_time) %>%
+ gather(key=worklog_author, value=logged_time, -c(logged_date)) %>%
+ replace_na(list(logged_time=0)) %>%
+  
+ggplot(aes(logged_date, logged_time/3600, fill = worklog_author)) +
+  geom_col(alpha = 0.95, position = "stack") +
+  theme_minimal() +
+   labs(title = "", y = "Рабочие часы",
+           subtitle = "", fill = "Эпик  ")+
+   theme(strip.text.y = element_text(angle = 0, face = "bold", colour ="grey40", family = "Trebuchet MS"),
+         
+          axis.text.x = element_text(vjust = 0.5),
+
+          axis.title.y = element_text(size = 10, hjust = 0, vjust = 6, face = "bold", colour ="grey40", family = "Trebuchet MS"),
+          axis.title.x = element_blank(),
+
+          panel.grid.major.x = element_blank(),
+
+          plot.title = element_blank(),
+          plot.margin = unit(c(1,1,1,1), "cm"),
+         
+          legend.position = "null") +
+      
+     scale_x_date(expand=c(0,0)) + scale_fill_manual(values = getPalette(9)) + 
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE)) + 
+  facet_grid(rows = vars(worklog_author))
+
+```
+<br>
+
+### Чем занималась команда прошедшую неделю? 
+
+<br>
+
+
+```{r echo=FALSE, fig.height=7.5, fig.width=10.5, fig.align = c("center"), message=FALSE, warning=FALSE}
+
+jira_worklog_data %>% 
+  mutate(logged_date = as.Date(started)) %>% 
+  filter(logged_date >= start_date) %>% 
+  filter(logged_date <= end_date) %>%
+  select(key, logged_date, time_spent_seconds, worklog_author) %>% 
+  group_by(key, logged_date, worklog_author) %>% 
+  summarise(logged_time = sum(time_spent_seconds)) %>% 
+  
+  left_join(issue_and_epic_data, by = "key") %>%
+  select(logged_date, logged_time, epic_summary) %>% 
+  group_by(logged_date, epic_summary) %>% 
+  summarise(logged_time = sum(logged_time)) %>%
+  
+ ungroup() %>%
+ spread(key=epic_summary, value=logged_time) %>%
+ gather(key=epic_summary, value=logged_time, -c(logged_date)) %>%
+ replace_na(list(logged_time=0)) %>%
+  
+  mutate(epic_summary = ifelse(epic_summary == "<NA>", "Эпик не указан", epic_summary))  %>%
+  
+ggplot(aes(logged_date, logged_time, fill = epic_summary)) +
+  geom_area(alpha = 0.95, position = "fill") +
+  theme_minimal() +
+   labs(title = "Разрез по эпикам - общий", fill = "Эпик  ")+
+   theme(axis.text.x = element_text(vjust = 0.5),
+          axis.text.y = element_blank(),
+
+          axis.title.y = element_blank(),
+          axis.title.x = element_blank(),
+
+          panel.grid.major.x = element_blank(),
+
+          plot.title = element_text(face = "bold", colour ="grey30", family = "Trebuchet MS"),
+          plot.margin = unit(c(1,1,1,1), "cm"),
+         
+          legend.position = "bottom",
+          legend.direction = "horizontal",
+          legend.text = element_text(colour ="grey20", family = "Trebuchet MS"),
+          legend.title = element_text(face = "bold", colour ="grey40", family = "Trebuchet MS")) +
+      
+     scale_x_date(expand=c(0,0)) + scale_fill_manual(values = getPalette(11)) + 
+  guides(fill = guide_legend(nrow = 4, byrow = TRUE))
+
+```
+<br>
+
+#### Выражаясь языком цифр, все залогированное время потрачено на:
+
+<br>
+
+```{r Подсчет процентов, echo=FALSE, message=FALSE, warning=FALSE}
+
+jira_worklog_data %>% 
+  mutate(logged_date = as.Date(started)) %>% 
+  filter(logged_date >= start_date) %>% 
+  filter(logged_date <= end_date) %>%
+  select(key, logged_date, time_spent_seconds, worklog_author) %>% 
+  group_by(key, logged_date, worklog_author) %>% 
+  summarise(logged_time = sum(time_spent_seconds)) %>% 
+  
+  left_join(issue_and_epic_data, by = "key") %>%
+  select(logged_date, logged_time, epic_summary) %>% 
+  group_by(epic_summary) %>% 
+  summarise(logged_time = sum(logged_time)) %>% 
+  mutate(epic_summary = ifelse(is.na(epic_summary), "Не понятно на что", epic_summary),
+         percentage = round(logged_time/sum(logged_time)*100)) %>% 
+  select(-logged_time) %>%
+  arrange(desc(percentage)) %>% 
+  mutate(percentage = paste0(percentage, "%")) %>% 
+  
+                    flextable() %>% 
+                    theme_booktabs() %>% 
+                    width(width = 10) %>%
+                    delete_part(part = "header") %>% 
+                    padding(padding = 10,  part = "body") %>% 
+                    flextable::fontsize(j = 1, size = 14, part = "body") %>%
+                    flextable::fontsize(j = 2, size = 16, part = "body") %>%
+                    bg(bg = "#f8f9fb") %>%
+                    flextable::font(fontname = "Trebuchet MS") %>%
+                    align(align = "center", part = "body")%>% 
+                    color(color = "#333333", part = "body") %>%
+                    border_remove() %>%
+                    flextable::border_inner_h(border = fp_border(color="#c8d0df", width = 1), part = "body")
+  
+
+```
+
+<br>
+
+
+```{r echo=FALSE, fig.height=6.5, fig.width=10.5, fig.align = c("center"), message=FALSE, warning=FALSE}
+
+getPalette = colorRampPalette(brewer.pal(9, "Set1"))
+
+jira_worklog_data %>% 
+  mutate(logged_date = as.Date(started)) %>% 
+  filter(logged_date >= start_date) %>% 
+  filter(logged_date <= end_date) %>%
+  select(key, logged_date, time_spent_seconds, worklog_author) %>% 
+  group_by(key, logged_date, worklog_author) %>% 
+  summarise(logged_time = sum(time_spent_seconds)) %>% 
+  
+  left_join(issue_and_epic_data, by = "key") %>%
+  select(logged_date, logged_time, issue_component) %>% 
+  group_by(logged_date, issue_component) %>% 
+  summarise(logged_time = sum(logged_time)) %>%
+  
+ ungroup() %>%
+ spread(key=issue_component, value=logged_time) %>%
+ gather(key=issue_component, value=logged_time, -c(logged_date)) %>%
+ replace_na(list(logged_time=0))  %>%
+  
+    mutate(issue_component = ifelse(issue_component == "<NA>", "Без компоненты", issue_component))  %>%
+  
+ mutate(issue_component = factor(issue_component, levels = c("S2P (Demand&Selection)", "R2D (Plan&Design)", "R2D (Develop)", "R2D (Test)", "R2D (Deploy)", "R2F", "D2C (Monitor&Feedback)", "D2C (Correct)", "Без компоненты"))) %>%
+  
+  
+ggplot(aes(logged_date, logged_time, fill = issue_component)) +
+  geom_area(alpha = 0.95, position = "fill") +
+  theme_minimal() +
+   labs(title = "Разрез по компонентам - общий", fill = "Компонента  ")+
+   theme(axis.text.x = element_text(vjust = 0.5),
+          axis.text.y = element_blank(),
+
+          axis.title.y = element_blank(),
+          axis.title.x = element_blank(),
+
+          panel.grid.major.x = element_blank(),
+
+          plot.title = element_text(face = "bold", colour ="grey30", family = "Trebuchet MS"),
+          plot.margin = unit(c(1,1,1,1), "cm"),
+         
+          legend.position = "bottom",
+          legend.direction = "horizontal",
+          legend.text = element_text(colour ="grey20", family = "Trebuchet MS"),
+          legend.title = element_text(face = "bold", colour ="grey40", family = "Trebuchet MS")) +
+      
+     scale_x_date(expand=c(0,0)) + scale_fill_manual(values = getPalette(10)) + 
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+
+```
+
+#### Выражаясь языком цифр, все залогированное время потрачено на:
+
+<br>
+
+```{r Подсчет процентов 2, echo=FALSE, message=FALSE, warning=FALSE}
+
+jira_worklog_data %>% 
+  mutate(logged_date = as.Date(started)) %>% 
+  filter(logged_date >= start_date) %>% 
+  filter(logged_date <= end_date) %>%
+  select(key, logged_date, time_spent_seconds, worklog_author) %>% 
+  group_by(key, logged_date, worklog_author) %>% 
+  summarise(logged_time = sum(time_spent_seconds)) %>% 
+  
+  left_join(issue_and_epic_data, by = "key") %>%
+  select(logged_date, logged_time, issue_component) %>% 
+  group_by(issue_component) %>% 
+  summarise(logged_time = sum(logged_time)) %>% 
+  mutate(issue_component = ifelse(is.na(issue_component), "Не понятно на что", issue_component),
+         percentage = round(logged_time/sum(logged_time)*100)) %>% 
+  
+  mutate(issue_component = factor(issue_component, levels = c("S2P (Demand&Selection)", "R2D (Plan&Design)", "R2D (Develop)", "R2D (Test)", "R2D (Deploy)", "R2F", "D2C (Monitor&Feedback)", "D2C (Correct)", "Не понятно на что"))) %>%
+  
+  select(-logged_time) %>%
+
+  arrange(issue_component) %>%
+  mutate(percentage = paste0(percentage, "%")) %>% 
+  
+                    flextable() %>% 
+                    theme_booktabs() %>% 
+                    width(width = 10) %>%
+                    delete_part(part = "header") %>% 
+                    padding(padding = 10,  part = "body") %>% 
+                    flextable::fontsize(j = 1, size = 14, part = "body") %>%
+                    flextable::fontsize(j = 2, size = 16, part = "body") %>%
+                    bg(bg = "#f8f9fb") %>%
+                    flextable::font(fontname = "Trebuchet MS") %>%
+                    align(align = "center", part = "body")%>% 
+                    color(color = "#333333", part = "body") %>%
+                    border_remove() %>%
+                    flextable::border_inner_h(border = fp_border(color="#c8d0df", width = 1), part = "body")
+  
+
+```
+
+<br>
+
+### Аналитика по сотрудникам 
+
+
+
+```{r echo=FALSE, fig.height=7.5, fig.width=10.5, fig.align = c("center"), message=FALSE, warning=FALSE}
+
+jira_worklog_data %>% 
+  mutate(logged_date = as.Date(started)) %>% 
+  filter(logged_date >= start_date) %>% 
+  filter(logged_date <= end_date) %>%
+  select(key, logged_date, time_spent_seconds, worklog_author) %>% 
+  group_by(key, logged_date, worklog_author) %>% 
+  summarise(logged_time = sum(time_spent_seconds)) %>% 
+  
+  left_join(issue_and_epic_data, by = "key") %>%
+  select(logged_date, logged_time, epic_summary, worklog_author) %>% 
+  group_by(logged_date, worklog_author, epic_summary) %>% 
+  summarise(logged_time = sum(logged_time)) %>%
+  
+ ungroup() %>%
+ spread(key=epic_summary, value=logged_time) %>%
+ gather(key=epic_summary, value=logged_time, -c(logged_date, worklog_author)) %>%
+ replace_na(list(logged_time=0)) %>%
+  
+   mutate(epic_summary = ifelse(epic_summary == "<NA>", "Эпик не указан", epic_summary))  %>%
+  
+ggplot(aes(logged_date, logged_time, fill = epic_summary)) +
+  geom_area(alpha = 0.95, position = "fill") +
+  theme_minimal() +
+   labs(title = "Разрез по эпикам - сотрудник\n", fill = "Эпик  ")+
+   theme(strip.text.y = element_text(angle = 0, face = "bold", colour ="grey40", family = "Trebuchet MS"),
+         
+          axis.text.x = element_text(vjust = 0.5),
+          axis.text.y = element_blank(),
+
+          axis.title.y = element_blank(),
+          axis.title.x = element_blank(),
+
+          panel.grid.major.x = element_blank(),
+
+          plot.title = element_text(face = "bold", colour ="grey30", family = "Trebuchet MS"),
+          plot.margin = unit(c(1,1,1,1), "cm"),
+         
+          legend.position = "bottom",
+          legend.direction = "horizontal",
+          legend.text = element_text(colour ="grey20", family = "Trebuchet MS"),
+          legend.title = element_text(face = "bold", colour ="grey40", family = "Trebuchet MS")) +
+      
+     scale_x_date(expand=c(0,0)) + scale_fill_manual(values = getPalette(11)) + 
+  guides(fill = guide_legend(nrow = 4, byrow = TRUE)) + 
+  facet_grid(rows = vars(worklog_author))
+```
+
+<br>
+
+```{r echo=FALSE, fig.height=7.5, fig.width=10.5, fig.align = c("center"), message=FALSE, warning=FALSE}
+
+getPalette = colorRampPalette(brewer.pal(9, "Set1"))
+
+jira_worklog_data %>% 
+  mutate(logged_date = as.Date(started)) %>% 
+  filter(logged_date >= start_date) %>% 
+  filter(logged_date <= end_date) %>%
+  select(key, logged_date, time_spent_seconds, worklog_author) %>% 
+  group_by(key, logged_date, worklog_author) %>% 
+  summarise(logged_time = sum(time_spent_seconds)) %>% 
+  
+  left_join(issue_and_epic_data, by = "key") %>%
+  select(logged_date, logged_time, issue_component, worklog_author) %>% 
+  group_by(logged_date, worklog_author, issue_component) %>% 
+  summarise(logged_time = sum(logged_time)) %>%
+  
+ ungroup() %>%
+ spread(key=issue_component, value=logged_time) %>%
+ gather(key=issue_component, value=logged_time, -c(logged_date, worklog_author)) %>%
+ replace_na(list(logged_time=0)) %>%
+  
+   mutate(issue_component = ifelse(issue_component == "<NA>", "Без компоненты", issue_component))  %>%
+  
+ mutate(issue_component = factor(issue_component, levels = c("S2P (Demand&Selection)", "R2D (Plan&Design)", "R2D (Develop)", "R2D (Test)", "R2D (Deploy)", "R2F", "D2C (Monitor&Feedback)", "D2C (Correct)", "Без компоненты"))) %>%
+  
+ggplot(aes(logged_date, logged_time, fill = issue_component)) +
+  geom_area(alpha = 0.95, position = "fill") +
+  theme_minimal() +
+   labs(title = "Разрез по компонентам - сотрудник\n", fill = "Эпик  ")+
+   theme(strip.text.y = element_text(angle = 0, face = "bold", colour ="grey40", family = "Trebuchet MS"),
+         
+          axis.text.x = element_text(vjust = 0.5),
+          axis.text.y = element_blank(),
+
+          axis.title.y = element_blank(),
+          axis.title.x = element_blank(),
+
+          panel.grid.major.x = element_blank(),
+
+          plot.title = element_text(face = "bold", colour ="grey30", family = "Trebuchet MS"),
+          plot.margin = unit(c(1,1,1,1), "cm"),
+         
+          legend.position = "bottom",
+          legend.direction = "horizontal",
+          legend.text = element_text(colour ="grey20", family = "Trebuchet MS"),
+          legend.title = element_text(face = "bold", colour ="grey40", family = "Trebuchet MS")) +
+      
+     scale_x_date(expand=c(0,0)) + scale_fill_manual(values = getPalette(10)) + 
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE)) + 
+  facet_grid(rows = vars(worklog_author))
+```
+<br>
+
+#### Подробнее о работе над тасками 
+
+<br>
+
+
+```{r Работа над тасками за неделю, message=FALSE, warning=FALSE, include=FALSE}
+
+
+# Открыто тасок
+
+this_week_opened <- jira_changelog_data %>% filter(issue_type != "Epic") %>% 
+  filter(as.Date(issue_created) >= start_date) %>% filter(as.Date(issue_created) <= end_date) %>% 
+  select(key) %>% left_join(jira_issues %>% select(key, summary, assignee.displayName) %>% unique()) %>%
+  filter(!grepl("daily", summary)) %>%
+  filter(!grepl("weekly", summary)) %>%
+  filter(!grepl("meet", summary)) %>%
+  unique()
+
+# В работе
+
+this_week_processed <- jira_worklog_data %>% filter(as.Date(started) >= start_date) %>% filter(as.Date(started) <= end_date) %>% 
+  select(key, worklog_author) %>% left_join(jira_issues %>% select(key, summary) %>% unique()) %>%
+  filter(!grepl("daily", summary)) %>%
+  filter(!grepl("weekly", summary)) %>%
+  filter(!grepl("meet", summary)) %>%
+  unique()
+
+# Закрыто
+
+this_week_closed <- jira_changelog_data %>% filter(issue_type != "Epic") %>% 
+  filter(as.Date(issue_resolutiondate) >= start_date) %>% filter(as.Date(issue_resolutiondate) <= end_date) %>% 
+  select(key) %>% left_join(jira_issues %>% select(key, summary, assignee.displayName) %>% unique()) %>%
+  filter(!grepl("daily", summary)) %>%
+  filter(!grepl("weekly", summary)) %>%
+  filter(!grepl("meet", summary)) %>%
+  unique()
+
+# Отправлено в холд / бэклог
+
+this_week_holded <- issue_history %>% filter(change_date >= start_date) %>% filter(as.Date(change_date) <= end_date) %>% 
+  filter(toString == "Hold" | toString == "Backlog") %>% select(key) %>% left_join(jira_issues %>% select(key, summary, assignee.displayName) %>% unique()) %>%
+  filter(!grepl("daily", summary)) %>%
+  filter(!grepl("weekly", summary)) %>%
+  filter(!grepl("meet", summary)) %>%
+  unique()
+
+```
+
+##### Открыто таски:
+<br>
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+ this_week_opened %>% 
+  select(-key) %>%
+  arrange(assignee.displayName) %>% 
+  
+                    flextable() %>% 
+                    theme_booktabs() %>% 
+                    width(width = 10) %>%
+                    delete_part(part = "header") %>% 
+                    padding(padding = 10,  part = "body") %>% 
+                    flextable::fontsize(j = 1, size = 14, part = "body") %>%
+                    flextable::fontsize(j = 2, size = 14, part = "body") %>%
+                    bg(bg = "#f8f9fb") %>%
+                    flextable::font(fontname = "Trebuchet MS") %>%
+                    align(align = "center", part = "body")%>% 
+                    color(color = "#333333", part = "body") %>%
+                    border_remove() %>%
+                    flextable::border_inner_h(border = fp_border(color="#c8d0df", width = 1), part = "body")
+```
+<br>
+
+##### Были в работе таски:
+
+<br>
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+ this_week_processed %>% 
+  select(-key) %>% select(summary, worklog_author) %>%
+  arrange(worklog_author) %>% 
+  
+                    flextable() %>% 
+                    theme_booktabs() %>% 
+                    width(width = 10) %>%
+                    delete_part(part = "header") %>% 
+                    padding(padding = 10,  part = "body") %>% 
+                    flextable::fontsize(j = 1, size = 14, part = "body") %>%
+                    flextable::fontsize(j = 2, size = 14, part = "body") %>%
+                    bg(bg = "#f8f9fb") %>%
+                    flextable::font(fontname = "Trebuchet MS") %>%
+                    align(align = "center", part = "body")%>% 
+                    color(color = "#333333", part = "body") %>%
+                    border_remove() %>%
+                    flextable::border_inner_h(border = fp_border(color="#c8d0df", width = 1), part = "body")
+```
+
+<br>
+
+##### Закрыто таски:
+
+<br>
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+ this_week_closed %>% 
+  select(-key) %>%
+  arrange(assignee.displayName) %>% 
+  
+                    flextable() %>% 
+                    theme_booktabs() %>% 
+                    width(width = 10) %>%
+                    delete_part(part = "header") %>% 
+                    padding(padding = 10,  part = "body") %>% 
+                    flextable::fontsize(j = 1, size = 14, part = "body") %>%
+                    flextable::fontsize(j = 2, size = 14, part = "body") %>%
+                    bg(bg = "#f8f9fb") %>%
+                    flextable::font(fontname = "Trebuchet MS") %>%
+                    align(align = "center", part = "body")%>% 
+                    color(color = "#333333", part = "body") %>%
+                    border_remove() %>%
+                    flextable::border_inner_h(border = fp_border(color="#c8d0df", width = 1), part = "body")
+```
+
+<br>
+
+##### Отправлено в холд / бэклог:
+
+<br>
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+ this_week_holded %>% 
+  select(-key) %>% select(summary, assignee.displayName) %>%
+  arrange(assignee.displayName) %>% 
+  
+                    flextable() %>% 
+                    theme_booktabs() %>% 
+                    width(width = 10) %>%
+                    delete_part(part = "header") %>% 
+                    padding(padding = 10,  part = "body") %>% 
+                    flextable::fontsize(j = 1, size = 14, part = "body") %>%
+                    flextable::fontsize(j = 2, size = 14, part = "body") %>%
+                    bg(bg = "#f8f9fb") %>%
+                    flextable::font(fontname = "Trebuchet MS") %>%
+                    align(align = "center", part = "body")%>% 
+                    color(color = "#333333", part = "body") %>%
+                    border_remove() %>%
+                    flextable::border_inner_h(border = fp_border(color="#c8d0df", width = 1), part = "body")
+```
+
+<br>
