@@ -1,4 +1,4 @@
-# NiFi_Jira_analytics
+# NiFi Jira Analytics
 
 Files for Jira Software analytics automation project via Apache NiFi.
 
